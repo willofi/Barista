@@ -408,11 +408,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     for style in StatusIconStyle.allCases {
       let item = NSMenuItem(
         title: style.title, action: #selector(selectIconStyle(_:)), keyEquivalent: "")
-      item.image = style.image(collapsed: true)
-      item.preferredImageVisibility = .visible
       item.target = self
       item.representedObject = style.rawValue
-      styleChoice(item, selected: iconStyle == style)
+      MenuChoiceRow.install(
+        on: item, selected: iconStyle == style, icon: style.image(collapsed: true))
       styles.addItem(item)
     }
     let appearance = NSMenuItem(title: "아이콘 모양", action: nil, keyEquivalent: "")
@@ -423,7 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     let never = NSMenuItem(
       title: "사용 안 함", action: #selector(disableAutoCollapse), keyEquivalent: "")
     never.target = self
-    styleChoice(never, selected: !autoCollapse)
+    MenuChoiceRow.install(on: never, selected: !autoCollapse)
     delays.addItem(never)
     delays.addItem(.separator())
     for delay in AutoCollapseDelay.allCases {
@@ -432,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         keyEquivalent: "")
       item.target = self
       item.tag = delay.rawValue
-      styleChoice(item, selected: autoCollapse && autoCollapseDelay == delay)
+      MenuChoiceRow.install(on: item, selected: autoCollapse && autoCollapseDelay == delay)
       delays.addItem(item)
     }
     let timing = NSMenuItem(title: "자동 접기", action: nil, keyEquivalent: "")
@@ -441,27 +440,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     menu.addItem(.separator())
     addMenuItem("종료 (아이콘 복원)", action: #selector(quit))
   }
-  private func styleChoice(_ item: NSMenuItem, selected: Bool) {
-    item.state = selected ? .on : .off
-    guard selected else { return }
-    let label = NSMutableAttributedString(
-      string: item.title,
-      attributes: [
-        .font: NSFont.systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold),
-        .foregroundColor: NSColor.controlAccentColor,
-      ])
-    label.append(NSAttributedString(string: "  "))
-    label.append(
-      NSAttributedString(
-        string: "사용 중",
-        attributes: [
-          .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-          .foregroundColor: NSColor.controlAccentColor,
-          .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.12),
-        ]))
-    item.attributedTitle = label
-  }
-
   @discardableResult private func addMenuItem(_ title: String, action: Selector) -> NSMenuItem {
     let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
     item.target = self
