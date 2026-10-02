@@ -14,3 +14,5 @@ xcrun swiftc -swift-version 6 -target arm64-apple-macos27.0 -module-cache-path "
   Sources/Barista/MenuItemDiscovery.swift Sources/Barista/MenuVisibilityBridge.swift \
   Sources/Barista/SystemMenuArea.swift Tests/SetupChecks.swift -o .build/setup-checks
 .build/setup-checks
+
+zsh scripts/reorder-check.sh

@@ -24,7 +24,14 @@ private final class VisibilityToken: @unchecked Sendable {
 }
 
 @MainActor
-final class MenuVisibilityBridge {
+protocol MenuVisibilityControlling {
+  var isAvailable: Bool { get }
+  func restrict(allowedBundleIDs: Set<String>, completion: @escaping @MainActor (String?) -> Void)
+  func release()
+}
+
+@MainActor
+final class MenuVisibilityBridge: MenuVisibilityControlling {
   private let classes: (assertion: NSObject.Type, configuration: NSObject.Type)?
   private var active: VisibilityToken?
   private var pending: VisibilityToken?

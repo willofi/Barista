@@ -46,7 +46,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private var restoreTimer: Timer?
   private var activationTimer: Timer?
   private let menu = NSMenu()
-  private let visibility = MenuVisibilityBridge()
+  private let visibility: any MenuVisibilityControlling
+  private let accessibilityCheck: @MainActor () -> Bool
+  private let scanItems: @Sendable ([MenuItemDiscovery.Candidate]) -> [MenuItemPosition]
+
+  init(
+    visibility: any MenuVisibilityControlling = MenuVisibilityBridge(),
+    accessibilityCheck: @escaping @MainActor () -> Bool = { AXIsProcessTrusted() },
+    scanItems: @escaping @Sendable ([MenuItemDiscovery.Candidate]) -> [MenuItemPosition] =
+      MenuItemDiscovery.scan
+  ) {
+    self.visibility = visibility
+    self.accessibilityCheck = accessibilityCheck
+    self.scanItems = scanItems
+    super.init()
+  }
   private let systemMenuArea = SystemMenuArea()
   private var hiddenIDs: Set<String> = []
   private var ownBundleIDs: Set<String> {
@@ -62,6 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private var pointerMonitor: Any?
   private var keyMonitor: Any?
   private var localKeyMonitor: Any?
+  private var menuBarDragWasCollapsed: Bool?
+  private var layoutRefreshTask: Task<Void, Never>?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     let appMenu = NSMenu()
@@ -104,9 +120,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       })
     // The private service affects Notification Center. Lift its restriction
     // before entering the clock/control area, then restore it after leaving.
-    pointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) {
-      [weak self] _ in
-      self?.pointerMoved()
+    pointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: [
+      .mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+    ]) {
+      [weak self] event in
+      self?.handlePointerEvent(event)
     }
     keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
       self?.handleRestoreShortcut(event)
@@ -146,6 +164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       if closeSetupOnSuccess { helpWindow?.close() }
       return
     }
+    layoutRefreshTask?.cancel()
+    layoutRefreshTask = nil
     requestNumber += 1
     let request = requestNumber
     collapseTimer?.invalidate()
@@ -191,8 +211,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       }
     }
     Task { @MainActor [weak self] in
+      let scanItems = self?.scanItems ?? MenuItemDiscovery.scan
       let items = await Task.detached(priority: .userInitiated) {
-        MenuItemDiscovery.scan(candidates)
+        scanItems(candidates)
       }.value
       guard let self, self.requestNumber == request else { return }
       self.hiddenIDs = HiddenSelection.bundleIDs(items: items, boundary: boundary).subtracting(
@@ -245,6 +266,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       }
     }
   }
+  func handlePointerEvent(_ event: NSEvent, at location: CGPoint? = nil) {
+    let point = location ?? NSEvent.mouseLocation
+    let isInMenuBar = NSScreen.screens.contains {
+      $0.frame.contains(point) && point.y >= $0.frame.maxY - NSStatusBar.system.thickness
+    }
+    if event.type == .leftMouseDragged, event.modifierFlags.contains(.command),
+      isInMenuBar, menuBarDragWasCollapsed == nil
+    {
+      // Read positions only after the complete layout is visible and the drag ends.
+      let wasCollapsed = collapsed || isApplying
+      setCollapsed(false)
+      collapseTimer?.invalidate()
+      menuBarDragWasCollapsed = wasCollapsed
+    }
+    if event.type == .leftMouseUp, let wasCollapsed = menuBarDragWasCollapsed {
+      // Command may have been released before the mouse button.
+      menuBarDragWasCollapsed = nil
+      if wasCollapsed {
+        let request = requestNumber
+        layoutRefreshTask = Task { @MainActor [weak self] in
+          do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+          guard let self, self.requestNumber == request else { return }
+          self.setCollapsed(true)
+        }
+      } else {
+        scheduleAutoCollapse()
+      }
+    }
+    pointerMoved()
+  }
+
   private func pointerMoved() {
     guard collapsed else { return }
     let point = NSEvent.mouseLocation
@@ -278,7 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private func scheduleAutoCollapse() {
     collapseTimer?.invalidate()
     collapseTimer = nil
-    guard autoCollapse, !collapsed, !isApplying, helpWindow?.isVisible != true, AXIsProcessTrusted()
+    guard autoCollapse, !collapsed, !isApplying, helpWindow?.isVisible != true, accessibilityCheck()
     else { return }
     collapseTimer = Timer.scheduledTimer(
       withTimeInterval: autoCollapseDelay.interval, repeats: false
@@ -296,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
   }
   func refreshAccessibilityPermission() {
-    let granted = AXIsProcessTrusted()
+    let granted = accessibilityCheck()
     let wasGranted = accessibilityGranted
     accessibilityGranted = granted
     if wasGranted && !granted {
@@ -352,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     addMenuItem(collapsed ? "숨긴 아이콘 펼치기" : "아이콘 접기", action: #selector(toggle))
     addMenuItem("설정…", action: #selector(showHelp))
     let styles = NSMenu(title: "아이콘 모양")
+    styles.showsStateColumn = false
     for style in StatusIconStyle.allCases {
       let item = NSMenuItem(
         title: style.title, action: #selector(selectIconStyle(_:)), keyEquivalent: "")
@@ -359,17 +412,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       item.preferredImageVisibility = .visible
       item.target = self
       item.representedObject = style.rawValue
-      item.state = iconStyle == style ? .on : .off
+      styleChoice(item, selected: iconStyle == style)
       styles.addItem(item)
     }
     let appearance = NSMenuItem(title: "아이콘 모양", action: nil, keyEquivalent: "")
     appearance.submenu = styles
     menu.addItem(appearance)
     let delays = NSMenu(title: "자동 접기")
+    delays.showsStateColumn = false
     let never = NSMenuItem(
       title: "사용 안 함", action: #selector(disableAutoCollapse), keyEquivalent: "")
     never.target = self
-    never.state = autoCollapse ? .off : .on
+    styleChoice(never, selected: !autoCollapse)
     delays.addItem(never)
     delays.addItem(.separator())
     for delay in AutoCollapseDelay.allCases {
@@ -378,7 +432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         keyEquivalent: "")
       item.target = self
       item.tag = delay.rawValue
-      item.state = autoCollapse && autoCollapseDelay == delay ? .on : .off
+      styleChoice(item, selected: autoCollapse && autoCollapseDelay == delay)
       delays.addItem(item)
     }
     let timing = NSMenuItem(title: "자동 접기", action: nil, keyEquivalent: "")
@@ -387,6 +441,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     menu.addItem(.separator())
     addMenuItem("종료 (아이콘 복원)", action: #selector(quit))
   }
+  private func styleChoice(_ item: NSMenuItem, selected: Bool) {
+    item.state = selected ? .on : .off
+    guard selected else { return }
+    let label = NSMutableAttributedString(
+      string: item.title,
+      attributes: [
+        .font: NSFont.systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold),
+        .foregroundColor: NSColor.controlAccentColor,
+      ])
+    label.append(NSAttributedString(string: "  "))
+    label.append(
+      NSAttributedString(
+        string: "사용 중",
+        attributes: [
+          .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+          .foregroundColor: NSColor.controlAccentColor,
+          .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.12),
+        ]))
+    item.attributedTitle = label
+  }
+
   @discardableResult private func addMenuItem(_ title: String, action: Selector) -> NSMenuItem {
     let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
     item.target = self
@@ -431,6 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   }
   @objc private func quit() { NSApp.terminate(nil) }
   func applicationWillTerminate(_ notification: Notification) {
+    layoutRefreshTask?.cancel()
     requestNumber += 1
     collapseTimer?.invalidate()
     restoreTimer?.invalidate()
