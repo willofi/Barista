@@ -15,7 +15,7 @@ Developer ID 인증서가 있는 환경에서는 다음처럼 빌드합니다.
 ```sh
 BARISTA_SIGNING_IDENTITY='Developer ID Application: YOUR NAME (TEAMID)' zsh scripts/build.sh
 zsh scripts/release.sh
-xcrun notarytool submit dist/Barista-0.3.0-macos27-arm64.zip --keychain-profile YOUR_PROFILE --wait
+xcrun notarytool submit dist/Barista-0.2.0-macos27-arm64.zip --keychain-profile YOUR_PROFILE --wait
 xcrun stapler staple build/Barista.app
 xcrun stapler validate build/Barista.app
 zsh scripts/release.sh
@@ -28,3 +28,7 @@ zsh scripts/release.sh
 앱을 /Applications에 설치하고 현재 앱의 손쉬운 사용 권한을 확인합니다. 접은 뒤 충분히 기다려 자기 버튼이 남는지, 클릭·우클릭이 가능한지, 5가지 미리보기와 자동 접기 시간, 시계 영역 임시 펼치기, Finder 재실행 복구를 확인합니다. 빌드마다 개발 서명이 바뀔 수 있으므로 모든 빌드를 끝낸 뒤 권한을 재등록하세요.
 
 테스트 중 SetupChecks 실행 파일은 손쉬운 사용 권한이 없는 프로세스여야 합니다. 전체 검사 스크립트는 macOS 27 실행 환경을 요구합니다.
+
+## 버전 번호
+
+첫 공개는 0.1.0, 다음 기능 릴리즈는 0.2.0입니다. 공개한 뒤 버그 수정 배포에는 패치 버전을 올립니다. 로컬 테스트마다 공개 버전을 바꾸지 않으며 CFBundleVersion의 내부 빌드 번호만 올립니다.
