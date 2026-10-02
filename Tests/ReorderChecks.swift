@@ -5,8 +5,13 @@ import Foundation
 final class RecordingVisibility: MenuVisibilityControlling {
   let isAvailable = true
   var configurations: [Set<String>] = []
-  func restrict(allowedBundleIDs: Set<String>, completion: @escaping @MainActor (String?) -> Void) {
+  var systemConfigurations: [Set<Int>] = []
+  func restrict(
+    allowedBundleIDs: Set<String>, hiddenSystemIDs: Set<Int>,
+    completion: @escaping @MainActor (String?) -> Void
+  ) {
     configurations.append(allowedBundleIDs)
+    systemConfigurations.append(hiddenSystemIDs)
     completion(nil)
   }
   func release() {}
@@ -86,6 +91,93 @@ struct ReorderChecks {
     try? await Task.sleep(for: .milliseconds(400))
     precondition(!controller.collapsed && service.configurations.count == 3)
     controller.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+    let systemService = RecordingVisibility()
+    let systemController = AppDelegate(
+      visibility: systemService, accessibilityCheck: { true },
+      scanItems: { _ in
+        [
+          .init(bundleID: "com.apple.MenuBarAgent", x: -100000, systemID: 6),
+          .init(bundleID: "com.apple.MenuBarAgent", x: 100000, systemID: 0),
+        ]
+      })
+    app.delegate = systemController
+    systemController.applicationDidFinishLaunching(
+      Notification(name: NSApplication.didFinishLaunchingNotification))
+    systemController.autoCollapse = false
+    systemController.setCollapsed(true)
+    await settle { systemController.collapsed && !systemController.isApplying }
+    precondition(
+      systemController.collapsed && systemController.hiddenAppCount == 1,
+      "A layout with only system icons on the left must collapse")
+    precondition(
+      systemService.systemConfigurations == [[6]],
+      "Only left-side Wi-Fi must be removed from the system allow list")
+    precondition(
+      systemService.configurations.last!.contains("com.apple.MenuBarAgent"),
+      "The status-item host must stay allowed")
+    // Run the real timer path: an external popup outlives the configured delay.
+    systemController.finishSetup()
+    var interacting = true
+    systemController.interactionBusyOverride = { interacting }
+    systemController.setCollapsed(false)
+    systemController.autoCollapseDelay = .three
+    systemController.autoCollapse = true
+    systemController.refreshInteractionActivity()
+    try? await Task.sleep(for: .milliseconds(3200))
+    precondition(
+      !systemController.collapsed,
+      "An external menu must stay expanded beyond the auto-collapse delay")
+    interacting = false
+    systemController.refreshInteractionActivity()
+    try? await Task.sleep(for: .milliseconds(1500))
+    precondition(
+      !systemController.collapsed,
+      "Ending interaction must restart the full delay, not reuse elapsed time")
+    try? await Task.sleep(for: .milliseconds(1800))
+    await settle { systemController.collapsed }
+    precondition(systemController.collapsed, "Idle time must eventually collapse")
+    systemController.setCollapsed(false)
+    interacting = true
+    systemController.refreshInteractionActivity()
+    systemController.setCollapsed(true)
+    await settle { systemController.collapsed }
+    precondition(
+      systemController.collapsed,
+      "Explicit collapse must work even while the pointer or a popup is busy")
+    systemController.autoCollapse = false
+    print(
+      "PASS: external interaction pauses collapse, idle restarts the full delay, manual collapse bypasses it"
+    )
+    systemController.applicationWillTerminate(
+      Notification(name: NSApplication.willTerminateNotification))
+    let menuMonitor = MenuInteractionMonitor(sample: {
+      InteractionSnapshot(windows: [], focusedPopup: false)
+    })
+    let staleService = RecordingVisibility()
+    let staleController = AppDelegate(
+      visibility: staleService, interactionMonitor: menuMonitor,
+      accessibilityCheck: { true }, scanItems: { _ in [.init(bundleID: "left", x: -100000)] })
+    app.delegate = staleController
+    staleController.applicationDidFinishLaunching(
+      Notification(name: NSApplication.didFinishLaunchingNotification))
+    staleController.finishSetup()
+    staleController.interactionBusyOverride = {
+      menuMonitor.isBusy(pointer: CGPoint(x: -100000, y: -100000))
+    }
+    staleController.autoCollapseDelay = .three
+    staleController.autoCollapse = true
+    menuMonitor.receiveMenuEvent(pid: 1519, token: 1_701_801_278, opened: true)
+    staleController.setCollapsed(false)
+    staleController.refreshInteractionActivity()
+    try? await Task.sleep(for: .milliseconds(4000))
+    precondition(
+      staleController.collapsed && staleService.configurations.count == 1,
+      "A captured stale Chrome menu event must recover and allow the real auto-collapse timer to finish"
+    )
+    staleController.autoCollapse = false
+    staleController.applicationWillTerminate(
+      Notification(name: NSApplication.willTerminateNotification))
+    print("PASS: stale Chrome menu events recover through the real automatic-collapse timer")
     print(
       "PASS: Command-drag refreshes the hidden side after release, even when Command is released first"
     )

@@ -7,15 +7,25 @@ import ApplicationServices
 final class SystemMenuArea {
   private var cachedRects: [CGRect] = []
   private var queriedAt = Date.distantPast
+  private var cachedHiddenSystemIDs: Set<Int> = []
 
-  func contains(_ point: CGPoint, excluding ownItem: CGRect?) -> Bool {
+  func contains(_ point: CGPoint, excluding ownItem: CGRect?, hiddenSystemIDs: Set<Int> = [])
+    -> Bool
+  {
+    if ownItem?.insetBy(dx: -4, dy: -4).contains(point) == true { return false }
+    // Hidden clock/control-center slots must not act as invisible hover triggers.
+    if hiddenSystemIDs.contains(2) && hiddenSystemIDs.contains(8) { return false }
+    if hiddenSystemIDs != cachedHiddenSystemIDs {
+      cachedHiddenSystemIDs = hiddenSystemIDs
+      queriedAt = .distantPast
+    }
     guard
       NSScreen.screens.contains(where: {
         point.y >= $0.frame.maxY - 40 && $0.frame.contains(point)
       })
     else { return false }
     if Date().timeIntervalSince(queriedAt) > 2 {
-      cachedRects = readFrames()
+      cachedRects = readFrames(hiddenSystemIDs: hiddenSystemIDs)
       queriedAt = Date()
     }
     if !cachedRects.isEmpty {
@@ -23,14 +33,13 @@ final class SystemMenuArea {
     }
     // An AX miss should preserve access to system menus, without making a
     // normally right-aligned toggle immediately unhide everything itself.
-    if ownItem?.insetBy(dx: -4, dy: -4).contains(point) == true { return false }
     return NSScreen.screens.contains { screen in
       CGRect(x: screen.frame.maxX - 180, y: screen.frame.maxY - 40, width: 180, height: 40)
         .contains(point)
     }
   }
 
-  private func readFrames() -> [CGRect] {
+  private func readFrames(hiddenSystemIDs: Set<Int>) -> [CGRect] {
     guard
       let agent = NSRunningApplication.runningApplications(
         withBundleIdentifier: "com.apple.MenuBarAgent"
@@ -47,7 +56,10 @@ final class SystemMenuArea {
     let groups = read(bar, kAXChildrenAttribute) as? [AXUIElement] ?? []
     let children =
       groups + groups.flatMap { read($0, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
-    let targetIDs: Set<String> = ["com.apple.menuextra.clock", "com.apple.menuextra.controlcenter"]
+    let targetIDs = Set(
+      [
+        ("com.apple.menuextra.clock", 2), ("com.apple.menuextra.controlcenter", 8),
+      ].filter { !hiddenSystemIDs.contains($0.1) }.map { $0.0 })
     return children.compactMap { item in
       guard let id = read(item, kAXIdentifierAttribute) as? String, targetIDs.contains(id),
         let position = read(item, kAXPositionAttribute),

@@ -176,7 +176,7 @@ struct SettingsView: View {
       }
 
       Text(
-        "macOS 27에서는 앱 단위로 숨기므로 한 앱의 아이콘은 함께 접힙니다. Apple의 시스템 아이콘은 유지합니다. 시계·제어 센터 위에서는 시스템 메뉴를 사용할 수 있도록 잠시 펼쳐져요."
+        "macOS 27에서는 앱 단위로 숨기므로 한 앱의 아이콘은 함께 접힙니다. Wi‑Fi·배터리 등 시스템 아이콘도 왼쪽에 두면 접힙니다. 같은 앱이나 시스템 프로세스가 만든 여러 아이콘은 함께 처리될 수 있습니다. 시계·제어 센터 위에서는 시스템 메뉴를 사용할 수 있도록 잠시 펼쳐져요."
       )
       .font(.callout).foregroundStyle(.secondary)
       .fixedSize(horizontal: false, vertical: true)

@@ -43,6 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private var toggleItem: NSStatusItem!
   private var helpWindow: NSWindow?
   private var collapseTimer: Timer?
+  private var interactionTimer: Timer?
+  private var interactionWasBusy = false
+  private let interactionMonitor: MenuInteractionMonitor
+  var interactionBusyOverride: (() -> Bool)?
+  private var localPointerMonitor: Any?
   private var restoreTimer: Timer?
   private var activationTimer: Timer?
   private let menu = NSMenu()
@@ -52,17 +57,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
   init(
     visibility: any MenuVisibilityControlling = MenuVisibilityBridge(),
+    interactionMonitor: MenuInteractionMonitor = MenuInteractionMonitor(),
     accessibilityCheck: @escaping @MainActor () -> Bool = { AXIsProcessTrusted() },
     scanItems: @escaping @Sendable ([MenuItemDiscovery.Candidate]) -> [MenuItemPosition] =
       MenuItemDiscovery.scan
   ) {
     self.visibility = visibility
+    self.interactionMonitor = interactionMonitor
     self.accessibilityCheck = accessibilityCheck
     self.scanItems = scanItems
     super.init()
   }
   private let systemMenuArea = SystemMenuArea()
   private var hiddenIDs: Set<String> = []
+  private var hiddenSystemIDs: Set<Int> = []
   private var ownBundleIDs: Set<String> {
     Set(
       [Bundle.main.bundleIdentifier, NSRunningApplication.current.bundleIdentifier].compactMap {
@@ -121,11 +129,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     // The private service affects Notification Center. Lift its restriction
     // before entering the clock/control area, then restore it after leaving.
     pointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: [
-      .mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+      .mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .rightMouseUp,
     ]) {
       [weak self] event in
       self?.handlePointerEvent(event)
     }
+    localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+      .mouseMoved, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+    ]) { [weak self] event in
+      self?.handlePointerEvent(event)
+      return event
+    }
+    interactionTimer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+      Task { @MainActor in
+        guard let self, self.autoCollapse, !self.collapsed, !self.isApplying else { return }
+        self.interactionMonitor.poll()
+        self.refreshInteractionActivity()
+      }
+    }
+    RunLoop.main.add(interactionTimer!, forMode: .common)
     keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
       self?.handleRestoreShortcut(event)
     }
@@ -218,8 +240,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       guard let self, self.requestNumber == request else { return }
       self.hiddenIDs = HiddenSelection.bundleIDs(items: items, boundary: boundary).subtracting(
         self.ownBundleIDs)
-      self.hiddenAppCount = self.hiddenIDs.count
-      guard !self.hiddenIDs.isEmpty else {
+      self.hiddenSystemIDs = HiddenSelection.systemIDs(items: items, boundary: boundary)
+      self.hiddenAppCount = self.hiddenIDs.count + self.hiddenSystemIDs.count
+      guard !self.hiddenIDs.isEmpty || !self.hiddenSystemIDs.isEmpty else {
         self.isApplying = false
         self.activationTimer?.invalidate()
         self.statusMessage = "숨길 아이콘이 없습니다. ⌘ + 드래그로 Barista 아이콘 왼쪽에 배치해 주세요."
@@ -243,14 +266,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
     let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
     let alwaysVisible = ownBundleIDs.union([
-      "com.apple.controlcenter", "com.apple.MenuBarAgent", "com.apple.systemuiserver",
-      "com.apple.TextInputMenuAgent", "com.apple.Siri", "com.apple.Spotlight",
-      "com.apple.wifi.WiFiAgent", "com.apple.UserNotificationCenter",
+      "com.apple.MenuBarAgent", "com.apple.UserNotificationCenter",
       "com.apple.notificationcenterui", "com.apple.loginwindow",
     ])
     let allowed = VisibilityPolicy.allowedBundleIDs(
       running: running, hidden: hiddenIDs, alwaysVisible: alwaysVisible)
-    visibility.restrict(allowedBundleIDs: allowed) { [weak self] error in
+    visibility.restrict(allowedBundleIDs: allowed, hiddenSystemIDs: hiddenSystemIDs) {
+      [weak self] error in
       guard let self, self.requestNumber == currentRequest else { return }
       self.activationTimer?.invalidate()
       self.isApplying = false
@@ -270,6 +292,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     let point = location ?? NSEvent.mouseLocation
     let isInMenuBar = NSScreen.screens.contains {
       $0.frame.contains(point) && point.y >= $0.frame.maxY - NSStatusBar.system.thickness
+    }
+    if isInMenuBar && [.leftMouseDown, .rightMouseDown].contains(event.type) {
+      // Own button/menu does not need an external popup ownership lookup.
+      if toggleItem.button?.window?.frame.contains(point) != true {
+        let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main
+        if let primary {
+          interactionMonitor.menuBarClicked(
+            at: CGPoint(x: point.x, y: primary.frame.maxY - point.y),
+            candidates: MenuItemDiscovery.popupCandidates())
+        }
+      }
     }
     if event.type == .leftMouseDragged, event.modifierFlags.contains(.command),
       isInMenuBar, menuBarDragWasCollapsed == nil
@@ -294,6 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         scheduleAutoCollapse()
       }
     }
+    refreshInteractionActivity()
     pointerMoved()
   }
 
@@ -301,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     guard collapsed else { return }
     let point = NSEvent.mouseLocation
     let nearSystemMenus = systemMenuArea.contains(
-      point, excluding: toggleItem.button?.window?.frame)
+      point, excluding: toggleItem.button?.window?.frame, hiddenSystemIDs: hiddenSystemIDs)
     if nearSystemMenus {
       restoreTimer?.invalidate()
       if !temporarilyShowing {
@@ -327,6 +361,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     toggleItem.button?.toolTip = "\(title) · 우클릭: 메뉴"
     toggleItem.button?.setAccessibilityLabel(title)
   }
+  func refreshInteractionActivity() {
+    guard autoCollapse, !collapsed, !isApplying else { return }
+    let busy = interactionBusyOverride?() ?? interactionMonitor.isBusy()
+    if busy {
+      interactionWasBusy = true
+      collapseTimer?.invalidate()
+      collapseTimer = nil
+    } else if interactionWasBusy {
+      interactionWasBusy = false
+      scheduleAutoCollapse()
+    }
+  }
+
   private func scheduleAutoCollapse() {
     collapseTimer?.invalidate()
     collapseTimer = nil
@@ -337,6 +384,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     ) { [weak self] _ in
       Task { @MainActor in
         guard let self, self.helpWindow?.isVisible != true else { return }
+        if self.interactionBusyOverride?() ?? self.interactionMonitor.isBusy() {
+          self.interactionWasBusy = true
+          return
+        }
         guard NSEvent.pressedMouseButtons == 0, !NSEvent.modifierFlags.contains(.command),
           RunLoop.main.currentMode != .eventTracking
         else {
@@ -360,6 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   }
   func refreshEnvironment() {
     refreshAccessibilityPermission()
+    interactionMonitor.refresh()
     competingManagers = NSWorkspace.shared.runningApplications.compactMap { app in
       guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
         let name = app.localizedName
@@ -490,6 +542,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     restoreTimer?.invalidate()
     activationTimer?.invalidate()
     visibility.release()
+    interactionTimer?.invalidate()
+    interactionMonitor.stop()
+    if let localPointerMonitor { NSEvent.removeMonitor(localPointerMonitor) }
     if let pointerMonitor { NSEvent.removeMonitor(pointerMonitor) }
     if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     if let localKeyMonitor { NSEvent.removeMonitor(localKeyMonitor) }

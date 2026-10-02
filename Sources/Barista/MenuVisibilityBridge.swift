@@ -26,7 +26,9 @@ private final class VisibilityToken: @unchecked Sendable {
 @MainActor
 protocol MenuVisibilityControlling {
   var isAvailable: Bool { get }
-  func restrict(allowedBundleIDs: Set<String>, completion: @escaping @MainActor (String?) -> Void)
+  func restrict(
+    allowedBundleIDs: Set<String>, hiddenSystemIDs: Set<Int>,
+    completion: @escaping @MainActor (String?) -> Void)
   func release()
 }
 
@@ -59,7 +61,8 @@ final class MenuVisibilityBridge: MenuVisibilityControlling {
   }
 
   func restrict(
-    allowedBundleIDs bundleIDs: Set<String>, completion: @escaping @MainActor (String?) -> Void
+    allowedBundleIDs bundleIDs: Set<String>, hiddenSystemIDs: Set<Int>,
+    completion: @escaping @MainActor (String?) -> Void
   ) {
     guard let classes else {
       completion("이 macOS 버전에서는 간격을 유지하는 숨김 방식을 사용할 수 없습니다.")
@@ -67,8 +70,10 @@ final class MenuVisibilityBridge: MenuVisibilityControlling {
     }
     let allocated = (classes.configuration as AnyObject)
       .perform(NSSelectorFromString("alloc"))?.takeUnretainedValue()
-    // Keep every known system item visible, including identifiers added by updates.
-    let systemIDs = (0..<64).map { NSNumber(value: $0) } as NSArray
+    // Restrict only identified items on the hidden side; preserve future system identifiers.
+    let systemIDs =
+      SystemItemCatalog.allAllowed.subtracting(hiddenSystemIDs).sorted().map { NSNumber(value: $0) }
+      as NSArray
     guard
       let configuration = allocated?.perform(
         Self.initializer, with: systemIDs,

@@ -61,6 +61,47 @@ struct LayoutChecks {
     precondition(allowed.contains(ownID), "RED: collapse can hide Barista's own control")
     precondition(allowed.contains("com.apple.controlcenter"))
     precondition(!allowed.contains("hidden-app") && allowed.contains("visible-app"))
+
+    let systemPositions: [MenuItemPosition] = [
+      .init(bundleID: "com.apple.MenuBarAgent", x: 100, systemID: 6),
+      .init(bundleID: "com.apple.MenuBarAgent", x: 300, systemID: 0),
+      .init(bundleID: "com.apple.MenuBarAgent", x: .nan, systemID: 2),
+      .init(bundleID: "com.apple.MenuBarAgent", x: 120, systemID: 8),
+    ]
+    precondition(HiddenSelection.systemIDs(items: systemPositions, boundary: 200) == [6, 8])
+    precondition(HiddenSelection.bundleIDs(items: systemPositions, boundary: 200).isEmpty)
+    precondition(SystemItemCatalog.identifier(for: "com.apple.menuextra.wifi") == 6)
+    precondition(SystemItemCatalog.identifier(for: "com.apple.menuextra.unknown") == nil)
+    precondition(SystemItemCatalog.allAllowed.subtracting([6]).contains(0))
+    let splitSystem =
+      systemPositions + [
+        MenuItemPosition(bundleID: "com.apple.MenuBarAgent", x: 350, systemID: 6)
+      ]
+    precondition(
+      HiddenSelection.systemIDs(items: splitSystem, boundary: 200) == [8],
+      "A system item spanning displays or both sides must remain visible")
+    precondition(HiddenSelection.systemIDs(items: systemPositions, boundary: .nan).isEmpty)
+    precondition(
+      SystemItemCatalog.allAllowed.subtracting([6, 8]).contains(63),
+      "Unknown system identifiers must remain allowed")
+    let systemArea = SystemMenuArea()
+    precondition(
+      !systemArea.contains(.zero, excluding: nil, hiddenSystemIDs: [2, 8]),
+      "Hidden system controls must not create ghost hover triggers")
+    let candidates = (0..<16).map {
+      MenuItemDiscovery.Candidate(pid: pid_t($0), bundleID: "app-\($0)")
+    }
+    let start = Date()
+    let scanned = ParallelMenuScan.run(candidates) { candidate in
+      Thread.sleep(forTimeInterval: 0.02)
+      return [.init(bundleID: candidate.bundleID, x: CGFloat(candidate.pid))]
+    }
+    precondition(
+      scanned.map(\.bundleID) == candidates.map(\.bundleID),
+      "Parallel discovery must preserve every process and deterministic ordering")
+    print(
+      "16 simulated slow processes scanned in \(Date().timeIntervalSince(start)) seconds (sequential minimum: 0.32 seconds)"
+    )
     let bridge = MenuVisibilityBridge()
     print("Selection and icon checks passed. macOS visibility API available: \(bridge.isAvailable)")
     bridge.release()
