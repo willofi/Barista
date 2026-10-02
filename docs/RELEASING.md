@@ -15,7 +15,7 @@ Developer ID 인증서가 있는 환경에서는 다음처럼 빌드합니다.
 ```sh
 BARISTA_SIGNING_IDENTITY='Developer ID Application: YOUR NAME (TEAMID)' zsh scripts/build.sh
 zsh scripts/release.sh
-xcrun notarytool submit dist/Barista-0.3.0-macos27-arm64.zip --keychain-profile YOUR_PROFILE --wait
+xcrun notarytool submit dist/Barista-0.1.0-macos27-arm64.zip --keychain-profile YOUR_PROFILE --wait
 xcrun stapler staple build/Barista.app
 xcrun stapler validate build/Barista.app
 zsh scripts/release.sh
