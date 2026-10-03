@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private var interactionWasBusy = false
   private let interactionMonitor: MenuInteractionMonitor
   var interactionBusyOverride: (() -> Bool)?
+  var inputBusyOverride: (() -> Bool)?
   private var localPointerMonitor: Any?
   private var restoreTimer: Timer?
   private var activationTimer: Timer?
@@ -54,18 +55,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private let visibility: any MenuVisibilityControlling
   private let accessibilityCheck: @MainActor () -> Bool
   private let scanItems: @Sendable ([MenuItemDiscovery.Candidate]) -> [MenuItemPosition]
+  private let discoverCandidates: @MainActor (Set<String>) -> [MenuItemDiscovery.Candidate]
+  private let workspaceNotifications: NotificationCenter
+  private var pendingLoginItems: [pid_t: MenuItemDiscovery.Candidate] = [:]
+  private var loginRefreshTask: Task<Void, Never>?
+  private var loginRefreshGeneration = 0
+  private var loginVisibilityNeedsUpdate = false
+  private var loginDiscoveryDeadline = Date.distantPast
 
   init(
     visibility: any MenuVisibilityControlling = MenuVisibilityBridge(),
     interactionMonitor: MenuInteractionMonitor = MenuInteractionMonitor(),
     accessibilityCheck: @escaping @MainActor () -> Bool = { AXIsProcessTrusted() },
     scanItems: @escaping @Sendable ([MenuItemDiscovery.Candidate]) -> [MenuItemPosition] =
-      MenuItemDiscovery.scan
+      MenuItemDiscovery.scan,
+    discoverCandidates: @escaping @MainActor (Set<String>) -> [MenuItemDiscovery.Candidate] = {
+      MenuItemDiscovery.candidates(excludingBundleIDs: $0)
+    },
+    workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter
   ) {
     self.visibility = visibility
     self.interactionMonitor = interactionMonitor
     self.accessibilityCheck = accessibilityCheck
     self.scanItems = scanItems
+    self.discoverCandidates = discoverCandidates
+    self.workspaceNotifications = workspaceNotifications
+    accessibilityGranted = accessibilityCheck()
     super.init()
   }
   private let systemMenuArea = SystemMenuArea()
@@ -88,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   private var layoutRefreshTask: Task<Void, Never>?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    loginDiscoveryDeadline = Date().addingTimeInterval(30)
     let appMenu = NSMenu()
     let root = NSMenuItem()
     root.submenu = appMenu
@@ -106,16 +122,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     toggleItem.button?.action = #selector(toggleClicked)
     toggleItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
     menu.delegate = self
-    let center = NSWorkspace.shared.notificationCenter
+    let center = workspaceNotifications
     for name in [
       NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
     ] {
       observers.append(
-        center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+        center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+          let changedID = (notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication)?.bundleIdentifier
+          let launched = notification.name == NSWorkspace.didLaunchApplicationNotification
           Task { @MainActor in
             guard let self else { return }
             self.refreshEnvironment()
-            if self.collapsed && !self.temporarilyShowing { self.applyRestriction() }
+            if launched { self.loginDiscoveryDeadline = Date().addingTimeInterval(30) }
+            if self.collapsed || self.isApplying {
+              if launched {
+                self.refreshLoginItems(launchedBundleID: changedID, afterLaunch: true)
+              } else {
+                if let changedID {
+                  self.pendingLoginItems = self.pendingLoginItems.filter { $0.value.bundleID != changedID }
+                }
+                if self.collapsed && !self.isApplying && !self.temporarilyShowing {
+                  self.applyRestriction()
+                }
+              }
+            } else {
+              self.scheduleAutoCollapse()
+            }
           }
         })
     }
@@ -161,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       UserDefaults.standard.set(true, forKey: "hasOpenedNativeVisibility")
       showHelp()
     }
+    scheduleAutoCollapse()
   }
 
   @objc private func toggleClicked() {
@@ -181,7 +215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   }
   @objc func toggle() { setCollapsed(isApplying ? false : !collapsed) }
 
-  func setCollapsed(_ value: Bool, closeSetupOnSuccess: Bool = false) {
+  func setCollapsed(_ value: Bool, closeSetupOnSuccess: Bool = false, automatic: Bool = false) {
     guard !value || !collapsed else {
       if closeSetupOnSuccess { helpWindow?.close() }
       return
@@ -195,6 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     activationTimer?.invalidate()
     statusMessage = nil
     if !value {
+      cancelLoginRefresh()
       visibility.release()
       collapsed = false
       isApplying = false
@@ -223,7 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       return
     }
     isApplying = true
-    let candidates = MenuItemDiscovery.candidates(excludingBundleIDs: ownBundleIDs)
+    let candidates = discoverCandidates(ownBundleIDs)
     let boundary = frame.minX
     activationTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
       Task { @MainActor in
@@ -245,11 +280,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
       guard !self.hiddenIDs.isEmpty || !self.hiddenSystemIDs.isEmpty else {
         self.isApplying = false
         self.activationTimer?.invalidate()
+        if automatic {
+          // At login there may be no icons yet. Keep startup retries quiet;
+          // opening settings here would block every later automatic attempt.
+          if Date() < self.loginDiscoveryDeadline { self.scheduleAutoCollapse() }
+          return
+        }
         self.statusMessage = "숨길 아이콘이 없습니다. ⌘ + 드래그로 Barista 아이콘 왼쪽에 배치해 주세요."
         self.showHelp()
         return
       }
       self.applyRestriction(request: request, closeSetupOnSuccess: closeSetupOnSuccess)
+      // An app may have launched before this scan but create its icon later.
+      self.refreshLoginItems()
+    }
+  }
+  private func cancelLoginRefresh() {
+    loginRefreshGeneration += 1
+    loginRefreshTask?.cancel()
+    loginRefreshTask = nil
+    pendingLoginItems.removeAll()
+    loginVisibilityNeedsUpdate = false
+  }
+
+  private func refreshLoginItems(launchedBundleID: String? = nil, afterLaunch: Bool = false) {
+    let candidates = discoverCandidates(ownBundleIDs)
+    // A relaunched app must be measurable before deciding which side it is on.
+    // Allow only that app temporarily; other hidden apps keep their selection.
+    if let launchedBundleID, hiddenIDs.remove(launchedBundleID) != nil {
+      hiddenAppCount = hiddenIDs.count + hiddenSystemIDs.count
+      loginVisibilityNeedsUpdate = true
+    }
+    // The native assertion is an allow-list snapshot. A newly running app
+    // must be allowed to create a visible/measurable item before classification.
+    loginVisibilityNeedsUpdate = loginVisibilityNeedsUpdate || afterLaunch
+    for candidate in candidates where !hiddenIDs.contains(candidate.bundleID) {
+      pendingLoginItems[candidate.pid] = candidate
+    }
+    loginRefreshTask?.cancel()
+    loginRefreshGeneration += 1
+    let generation = loginRefreshGeneration
+    loginRefreshTask = Task { @MainActor [weak self] in
+      var previousSelections: [pid_t: Bool] = [:]
+      var previousSystemSelections: Set<Int> = []
+      var attempts = 0
+      // Bounded retries cover login services whose status item appears after
+      // the launch notification. Non-menu apps must not be polled forever.
+      while attempts < 60 {
+        do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+        guard let self, self.loginRefreshGeneration == generation else { return }
+        guard self.collapsed || self.isApplying else { return }
+        guard !self.isApplying, !self.temporarilyShowing, self.menuBarDragWasCollapsed == nil
+        else { continue }
+        if self.loginVisibilityNeedsUpdate {
+          self.loginVisibilityNeedsUpdate = false
+          previousSelections.removeAll()
+          self.requestNumber += 1
+          self.applyRestriction()
+          continue
+        }
+        self.interactionMonitor.poll()
+        guard !(self.interactionBusyOverride?() ?? self.interactionMonitor.isBusy()),
+          self.accessibilityCheck(), let boundary = self.toggleItem.button?.window?.frame.minX
+        else { continue }
+        let candidates = Array(self.pendingLoginItems.values)
+        guard !candidates.isEmpty else { break }
+        attempts += 1
+        let scan = self.scanItems
+        let items = await Task.detached(priority: .utility) { scan(candidates) }.value
+        guard self.loginRefreshGeneration == generation, self.collapsed, !self.isApplying,
+          !self.temporarilyShowing,
+          let currentBoundary = self.toggleItem.button?.window?.frame.minX,
+          abs(currentBoundary - boundary) < 0.5
+        else {
+          previousSelections.removeAll()
+          previousSystemSelections.removeAll()
+          continue
+        }
+        var added = false
+        for candidate in candidates {
+          let positions = items.filter { $0.bundleID == candidate.bundleID }
+          guard !positions.isEmpty, positions.allSatisfy({ $0.x.isFinite }) else {
+            previousSelections.removeValue(forKey: candidate.pid)
+            if candidate.bundleID == "com.apple.MenuBarAgent" { previousSystemSelections.removeAll() }
+            continue
+          }
+          if candidate.bundleID == "com.apple.MenuBarAgent" {
+            let selection = HiddenSelection.systemIDs(items: positions, boundary: boundary)
+            let newIDs = selection.intersection(previousSystemSelections)
+              .subtracting(self.hiddenSystemIDs)
+            previousSystemSelections = selection
+            self.hiddenSystemIDs.formUnion(newIDs)
+            added = added || !newIDs.isEmpty
+            // System controls can be populated in multiple stages at login.
+            continue
+          }
+          let shouldHide = HiddenSelection.bundleIDs(items: positions, boundary: boundary)
+            .contains(candidate.bundleID)
+          guard previousSelections[candidate.pid] == shouldHide else {
+            previousSelections[candidate.pid] = shouldHide
+            continue
+          }
+          self.pendingLoginItems.removeValue(forKey: candidate.pid)
+          if shouldHide {
+            added = self.hiddenIDs.insert(candidate.bundleID).inserted || added
+          }
+        }
+        if added {
+          self.hiddenAppCount = self.hiddenIDs.count + self.hiddenSystemIDs.count
+          self.requestNumber += 1
+          self.applyRestriction()
+        }
+      }
+      guard let self, self.loginRefreshGeneration == generation else { return }
+      self.pendingLoginItems.removeAll()
+      self.loginRefreshTask = nil
     }
   }
   private func applyRestriction(request: Int? = nil, closeSetupOnSuccess: Bool = false) {
@@ -388,13 +533,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
           self.interactionWasBusy = true
           return
         }
-        guard NSEvent.pressedMouseButtons == 0, !NSEvent.modifierFlags.contains(.command),
-          RunLoop.main.currentMode != .eventTracking
-        else {
+        let inputBusy = self.inputBusyOverride?() ?? (
+          NSEvent.pressedMouseButtons != 0 || NSEvent.modifierFlags.contains(.command)
+            || RunLoop.main.currentMode == .eventTracking)
+        if inputBusy {
           self.scheduleAutoCollapse()
           return
         }
-        self.setCollapsed(true)
+        self.setCollapsed(true, automatic: true)
       }
     }
   }
@@ -536,6 +682,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
   }
   @objc private func quit() { NSApp.terminate(nil) }
   func applicationWillTerminate(_ notification: Notification) {
+    cancelLoginRefresh()
     layoutRefreshTask?.cancel()
     requestNumber += 1
     collapseTimer?.invalidate()
@@ -549,7 +696,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     if let localKeyMonitor { NSEvent.removeMonitor(localKeyMonitor) }
     for observer in observers {
-      NSWorkspace.shared.notificationCenter.removeObserver(observer)
+      workspaceNotifications.removeObserver(observer)
       NotificationCenter.default.removeObserver(observer)
     }
     if let toggleItem { NSStatusBar.system.removeStatusItem(toggleItem) }

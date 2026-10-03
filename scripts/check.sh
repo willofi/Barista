@@ -18,3 +18,5 @@ xcrun swiftc -swift-version 6 -target arm64-apple-macos27.0 -module-cache-path "
 zsh scripts/reorder-check.sh
 
 zsh scripts/interaction-check.sh
+
+zsh scripts/startup-check.sh
